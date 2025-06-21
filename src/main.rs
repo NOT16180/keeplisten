@@ -1,33 +1,29 @@
 mod youtube;
 mod audio;
+mod playlist;
 
 use std::io::{self, Write};
 use std::fs;
 use std::time::{Duration, Instant};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    event::{self, Event, KeyCode, EnableMouseCapture, DisableMouseCapture},
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    Terminal,
+    layout::{Constraint, Direction, Layout, Rect, Alignment},
     style::{Color, Modifier, Style},
-    text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap},
-    Frame, Terminal,
+    widgets::{Block, Borders, Paragraph, List, ListItem, Gauge, Clear, Wrap},
+    text:: Line,
+    Frame,
 };
-
-#[derive(Clone)]
-struct Track {
-    title: String,
-    url: String,
-    file_path: Option<String>,
-    duration: Option<String>,
-}
+use playlist::{Track, PlaylistManager};
 
 struct AppState {
-    tracks: Vec<Track>,
+    playlist_manager: PlaylistManager,
+    current_playlist: String,
     current_track: usize,
     is_playing: bool,
     is_paused: bool,
@@ -42,8 +38,11 @@ struct AppState {
 
 impl AppState {
     fn new() -> Self {
+        let mut playlist_manager = PlaylistManager::new();
+        playlist_manager.create_playlist("default");
         Self {
-            tracks: Vec::new(),
+            playlist_manager,
+            current_playlist: "default".to_string(),
             current_track: 0,
             is_playing: false,
             is_paused: false,
@@ -57,66 +56,87 @@ impl AppState {
         }
     }
 
-    fn add_track(&mut self, track: Track) {
-        self.tracks.push(track);
-        self.status_message = format!("Ajouté: {} pistes au total", self.tracks.len());
+    fn current_tracks(&self) -> Vec<Track> {
+        self.playlist_manager
+            .playlists
+            .get(&self.current_playlist)
+            .map(|p| p.tracks.clone())
+            .unwrap_or_default()
+    }
+
+    fn add_track_to_current(&mut self, track: Track) {
+        self.playlist_manager
+            .add_track_to_playlist(&self.current_playlist, track);
+        self.status_message =
+            format!("Ajouté à '{}' ({} pistes)", self.current_playlist, self.current_tracks().len());
     }
 
     fn next_track(&mut self) {
-        if !self.tracks.is_empty() {
-            self.current_track = (self.current_track + 1) % self.tracks.len();
+        let tracks = self.current_tracks();
+        if !tracks.is_empty() {
+            audio::stop_audio();
+            self.current_track = (self.current_track + 1) % tracks.len();
             self.progress = 0.0;
-            self.status_message = format!("Piste suivante: {}", 
-                self.tracks[self.current_track].title);
+            self.is_playing = false;
+            self.is_paused = false;
+            self.status_message = format!("Piste suivante: {}", tracks[self.current_track].title);
+            self.play_current_track();
         }
     }
 
     fn previous_track(&mut self) {
-        if !self.tracks.is_empty() {
+        let tracks = self.current_tracks();
+        if !tracks.is_empty() {
+            audio::stop_audio();
             self.current_track = if self.current_track == 0 {
-                self.tracks.len() - 1
+                tracks.len() - 1
             } else {
                 self.current_track - 1
             };
             self.progress = 0.0;
-            self.status_message = format!("Piste précédente: {}", 
-                self.tracks[self.current_track].title);
+            self.is_playing = false;
+            self.is_paused = false;
+            self.status_message = format!("Piste précédente: {}", tracks[self.current_track].title);
+            self.play_current_track();
         }
     }
 
     fn toggle_play_pause(&mut self) {
-        if self.tracks.is_empty() {
+        let tracks = self.current_tracks();
+        if tracks.is_empty() {
             self.status_message = "Aucune piste chargée".to_string();
             return;
         }
 
         if self.is_playing {
             self.is_paused = !self.is_paused;
-            self.status_message = if self.is_paused { 
-                "⏸️ Pause".to_string() 
-            } else { 
-                "▶️ Lecture".to_string() 
-            };
+            if self.is_paused {
+                audio::pause_audio();
+                self.status_message = "⏸️ Pause".to_string();
+            } else {
+                audio::resume_audio();
+                self.status_message = "▶️ Lecture".to_string();
+            }
         } else {
             self.play_current_track();
         }
     }
 
     fn play_current_track(&mut self) {
-        if let Some(track) = self.tracks.get(self.current_track) {
-            if let Some(file_path) = &track.file_path {
-                match audio::play_audio(file_path) {
-                    Ok(_) => {
-                        self.is_playing = true;
-                        self.is_paused = false;
-                        self.status_message = format!("▶️ Lecture: {}", track.title);
-                    }
-                    Err(e) => {
-                        self.status_message = format!("❌ Erreur lecture: {}", e);
-                    }
+        let tracks = self.current_tracks();
+        if let Some(track) = tracks.get(self.current_track) {
+            audio::stop_audio();
+            match audio::play_audio(&track.file_path) {
+                Ok(_) => {
+                    self.is_playing = true;
+                    self.is_paused = false;
+                    self.status_message = format!("▶️ Lecture: {}", track.title);
                 }
-            } else {
-                self.status_message = "Fichier audio non disponible".to_string();
+                Err(e) => {
+                    self.is_playing = false;
+                    self.is_paused = false;
+                    self.status_message = format!("❌ Erreur lecture: {}", e);
+                }
             }
         }
     }
@@ -129,46 +149,35 @@ impl AppState {
 
     fn update_progress(&mut self) {
         if self.is_playing && !self.is_paused {
-            // Simulation du progrès (dans une vraie app, ceci viendrait du lecteur audio)
-            self.progress += 0.01;
-            if self.progress >= 1.0 {
+            self.progress += 0.001;
+            let tracks = self.current_tracks();
+            if self.progress >= 1.0 && !tracks.is_empty() {
                 self.progress = 0.0;
                 self.next_track();
-                if !self.tracks.is_empty() {
-                    self.play_current_track();
-                }
             }
         }
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Vérifier que yt-dlp est disponible
     if !youtube::check_yt_dlp_available() {
         eprintln!("❌ yt-dlp n'est pas installé ou accessible.");
         eprintln!("Veuillez installer yt-dlp: pip install yt-dlp");
         return Ok(());
     }
 
-    println!("🎵 Lecteur Musical TUI");
+    println!("-keeplisten-");
     println!("===================");
-    
-    // Préparer le dossier de musique
+
     let music_dir = "music";
     fs::create_dir_all(music_dir)?;
 
-    // Charger les pistes existantes
     let mut app_state = AppState::new();
-    load_existing_tracks(&mut app_state, music_dir)?;
-
-    // Demande initiale si aucune piste n'est chargée
-    if app_state.tracks.is_empty() {
-        if let Some(track) = search_and_download_interactive(music_dir)? {
-            app_state.add_track(track);
-        }
+    let _ = app_state.playlist_manager.load_all_from_dir("playlists");
+    if app_state.current_tracks().is_empty() {
+        load_existing_tracks(&mut app_state, music_dir)?;
     }
 
-    // Initialisation de la TUI
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -177,7 +186,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let res = run_app(&mut terminal, &mut app_state, music_dir);
 
-    // Nettoyage du terminal
+    let _ = app_state.playlist_manager.save_all_to_dir("playlists");
+    audio::stop_audio();
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -194,6 +204,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn load_existing_tracks(app_state: &mut AppState, music_dir: &str) -> io::Result<()> {
+    let mut any = false;
     if let Ok(entries) = fs::read_dir(music_dir) {
         for entry in entries.flatten() {
             if let Some(ext) = entry.path().extension() {
@@ -203,79 +214,30 @@ fn load_existing_tracks(app_state: &mut AppState, music_dir: &str) -> io::Result
                         .and_then(|s| s.to_str())
                         .unwrap_or("Titre inconnu")
                         .to_string();
-                    
                     let track = Track {
                         title,
-                        url: String::new(),
-                        file_path: Some(entry.path().display().to_string()),
+                        file_path: entry.path().display().to_string(),
+                        url: None,
                         duration: None,
                     };
-                    
-                    app_state.tracks.push(track);
+                    app_state.add_track_to_current(track);
+                    any = true;
                 }
             }
         }
     }
-    
-    if !app_state.tracks.is_empty() {
-        app_state.status_message = format!("Chargé {} piste(s) existante(s)", app_state.tracks.len());
+    if any {
+        app_state.status_message = "Musique locale chargée dans la playlist par défaut".to_string();
     }
-    
     Ok(())
 }
 
-fn search_and_download_interactive(music_dir: &str) -> Result<Option<Track>, Box<dyn std::error::Error>> {
-    print!("🔍 Entrez le nom de la musique à rechercher: ");
+fn prompt(question: &str) -> io::Result<String> {
+    print!("{}", question);
     io::stdout().flush()?;
-    
-    let mut song_name = String::new();
-    io::stdin().read_line(&mut song_name)?;
-    let song_name = song_name.trim();
-    
-    if song_name.is_empty() {
-        return Ok(None);
-    }
-
-    println!("🔎 Recherche en cours...");
-    
-    let (video_url, video_title) = match youtube::search_first_video(song_name) {
-        Some(result) => result,
-        None => {
-            println!("❌ Aucun résultat trouvé pour '{}'", song_name);
-            return Ok(None);
-        }
-    };
-
-    println!("✅ Trouvé: {}", video_title);
-    println!("🔗 URL: {}", video_url);
-    print!("📥 Télécharger? (o/n): ");
-    io::stdout().flush()?;
-
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer)?;
-    
-    if !["o", "y", "oui", "yes"].contains(&answer.trim().to_lowercase().as_str()) {
-        println!("❌ Téléchargement annulé");
-        return Ok(None);
-    }
-
-    println!("⬇️ Téléchargement en cours...");
-    
-    match youtube::download_audio(&video_url, music_dir) {
-        Ok(file_path) => {
-            println!("✅ Téléchargé: {}", file_path);
-            Ok(Some(Track {
-                title: video_title,
-                url: video_url,
-                file_path: Some(file_path),
-                duration: None,
-            }))
-        }
-        Err(e) => {
-            println!("❌ Erreur téléchargement: {}", e);
-            Ok(None)
-        }
-    }
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim().to_string())
 }
 
 fn run_app<B: ratatui::backend::Backend>(
@@ -284,7 +246,6 @@ fn run_app<B: ratatui::backend::Backend>(
     music_dir: &str,
 ) -> io::Result<()> {
     loop {
-        // Mettre à jour le progrès
         if app_state.last_update.elapsed() >= Duration::from_millis(100) {
             app_state.update_progress();
             app_state.last_update = Instant::now();
@@ -296,7 +257,6 @@ fn run_app<B: ratatui::backend::Backend>(
             } else {
                 draw_main_ui(f, app_state);
             }
-            
             if app_state.show_help {
                 draw_help_popup(f);
             }
@@ -323,6 +283,73 @@ fn run_app<B: ratatui::backend::Backend>(
                             app_state.progress = 0.0;
                             app_state.status_message = "⏮️ Remis au début".to_string();
                         }
+                        // Playlists shortcuts
+                        KeyCode::Char('P') => {
+                            let name = prompt("Nom de la nouvelle playlist : ")?;
+                            if app_state.playlist_manager.create_playlist(&name) {
+                                app_state.status_message = format!("Playlist '{}' créée", name);
+                            } else {
+                                app_state.status_message = format!("Playlist '{}' existe déjà", name);
+                            }
+                        }
+                        KeyCode::Char('D') => {
+                            let pl = app_state.current_playlist.clone();
+                            if pl == "default" {
+                                app_state.status_message = "Impossible de supprimer la playlist par défaut".to_string();
+                            } else if app_state.playlist_manager.delete_playlist(&pl) {
+                                app_state.status_message = format!("Playlist '{}' supprimée", pl);
+                                app_state.current_playlist = "default".into();
+                                app_state.current_track = 0;
+                            } else {
+                                app_state.status_message = format!("Impossible de supprimer '{}'", pl);
+                            }
+                        }
+                        KeyCode::Char('A') => {
+                            let target = prompt("Ajouter la piste courante à quelle playlist ? ")?;
+                            let tracks = app_state.current_tracks();
+                            if let Some(track) = tracks.get(app_state.current_track).cloned() {
+                                if app_state.playlist_manager.add_track_to_playlist(&target, track) {
+                                    app_state.status_message = format!("Ajouté à '{}'", target);
+                                } else {
+                                    app_state.status_message = "Playlist introuvable".to_string();
+                                }
+                            }
+                        }
+                        KeyCode::Char('S') => {
+                            let pl = app_state.current_playlist.clone();
+                            if app_state
+                                .playlist_manager
+                                .remove_track_from_playlist_by_index(&pl, app_state.current_track)
+                            {
+                                app_state.status_message = "Piste retirée".to_string();
+                                app_state.current_track = 0;
+                            } else {
+                                app_state.status_message = "Erreur suppression".to_string();
+                            }
+                        }
+                        KeyCode::Char('L') => {
+                            let mut msg = "Playlists : ".to_string();
+                            let list = app_state
+                                .playlist_manager
+                                .playlists
+                                .keys()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            msg.push_str(&list);
+                            app_state.status_message = msg;
+                        }
+                        KeyCode::Char('C') => {
+                            let name = prompt("Aller à la playlist : ")?;
+                            if app_state.playlist_manager.playlists.contains_key(&name) {
+                                app_state.current_playlist = name;
+                                app_state.current_track = 0;
+                                app_state.progress = 0.0;
+                                app_state.status_message = "Changement de playlist".to_string();
+                            } else {
+                                app_state.status_message = "Playlist introuvable".to_string();
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -343,16 +370,21 @@ fn handle_search_input(
                 let query = app_state.search_input.clone();
                 app_state.search_mode = false;
                 app_state.status_message = format!("🔎 Recherche: {}", query);
-                
-                // Ici, dans une vraie app, on ferait la recherche en arrière-plan
-                // Pour cet exemple, on simule juste l'ajout
-                let track = Track {
-                    title: format!("Recherche: {}", query),
-                    url: String::new(),
-                    file_path: None,
-                    duration: None,
-                };
-                app_state.add_track(track);
+                if let Some((url, title)) = youtube::search_first_video(&query) {
+                    if let Ok(file_path) = youtube::download_audio(&url, music_dir) {
+                        let track = Track {
+                            title,
+                            file_path,
+                            url: Some(url),
+                            duration: None,
+                        };
+                        app_state.add_track_to_current(track);
+                    } else {
+                        app_state.status_message = "Erreur lors du téléchargement".to_string();
+                    }
+                } else {
+                    app_state.status_message = "Aucun résultat trouvé".to_string();
+                }
             } else {
                 app_state.search_mode = false;
             }
@@ -373,6 +405,7 @@ fn handle_search_input(
 }
 
 fn draw_main_ui(f: &mut Frame, app_state: &AppState) {
+    let tracks = app_state.current_tracks();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -381,32 +414,37 @@ fn draw_main_ui(f: &mut Frame, app_state: &AppState) {
             Constraint::Length(5),  // Player controls
             Constraint::Length(3),  // Status
         ])
-        .split(f.size());
+        .split(f.area());
 
-    // Header
-    let header = Paragraph::new("🎵 Lecteur Musical TUI")
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::ALL));
+    let header = Paragraph::new(format!(
+        "- Keeplisten -  [Playlist: {}]",
+        app_state.current_playlist
+    ))
+    .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+    .alignment(Alignment::Center)
+    .block(Block::default().borders(Borders::ALL));
     f.render_widget(header, chunks[0]);
 
-    // Playlist
-    let items: Vec<ListItem> = app_state.tracks
+    let items: Vec<ListItem> = tracks
         .iter()
         .enumerate()
         .map(|(i, track)| {
             let symbol = if i == app_state.current_track {
-                if app_state.is_playing && !app_state.is_paused { "▶️" }
-                else if app_state.is_paused { "⏸️" }
-                else { "⏹️" }
-            } else { "  " };
-            
+                if app_state.is_playing && !app_state.is_paused {
+                    "▶️"
+                } else if app_state.is_paused {
+                    "⏸️"
+                } else {
+                    "⏹️"
+                }
+            } else {
+                "  "
+            };
             let style = if i == app_state.current_track {
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
-            
             ListItem::new(format!("{} {}", symbol, track.title)).style(style)
         })
         .collect();
@@ -418,10 +456,8 @@ fn draw_main_ui(f: &mut Frame, app_state: &AppState) {
         .style(Style::default().fg(Color::White));
     f.render_widget(playlist, chunks[1]);
 
-    // Player controls
     draw_player_controls(f, chunks[2], app_state);
 
-    // Status bar
     let status = Paragraph::new(app_state.status_message.as_str())
         .style(Style::default().fg(Color::Green))
         .alignment(Alignment::Center)
@@ -439,20 +475,17 @@ fn draw_player_controls(f: &mut Frame, area: Rect, app_state: &AppState) {
         ])
         .split(Block::default().borders(Borders::ALL).title("🎮 Contrôles").inner(area));
 
-    // Progress bar
     let progress = Gauge::default()
         .block(Block::default())
         .gauge_style(Style::default().fg(Color::Cyan))
         .ratio(app_state.progress);
     f.render_widget(progress, chunks[0]);
 
-    // Controls info
-    let controls = Paragraph::new("Space: Play/Pause | ←→: Piste | ↑↓: Volume | S: Recherche | H: Aide | Q: Quitter")
+    let controls = Paragraph::new("Space: Play/Pause | ←→: Piste | ↑↓: Volume | S: Recherche | P: Nouvelle Playlist | D: Suppr Playlist | A: Ajout piste | S: Suppr piste | L: Lister | C: Changer | H: Aide | Q: Quitter")
         .style(Style::default().fg(Color::Gray))
         .alignment(Alignment::Center);
     f.render_widget(controls, chunks[1]);
 
-    // Volume
     let volume = Paragraph::new(format!("🔊 Volume: {}%", app_state.volume))
         .style(Style::default().fg(Color::White))
         .alignment(Alignment::Center);
@@ -461,10 +494,8 @@ fn draw_player_controls(f: &mut Frame, area: Rect, app_state: &AppState) {
 
 fn draw_search_popup(f: &mut Frame, app_state: &AppState) {
     draw_main_ui(f, app_state);
-    
-    let popup_area = centered_rect(50, 20, f.size());
+    let popup_area = centered_rect(50, 20, f.area());
     f.render_widget(Clear, popup_area);
-    
     let input = Paragraph::new(app_state.search_input.as_str())
         .style(Style::default().fg(Color::Yellow))
         .block(Block::default()
@@ -474,9 +505,9 @@ fn draw_search_popup(f: &mut Frame, app_state: &AppState) {
 }
 
 fn draw_help_popup(f: &mut Frame) {
-    let popup_area = centered_rect(60, 70, f.size());
+    let popup_area = centered_rect(60, 70, f.area());
     f.render_widget(Clear, popup_area);
-    
+
     let help_text = vec![
         Line::from("🎵 Aide du Lecteur Musical"),
         Line::from(""),
@@ -486,12 +517,18 @@ fn draw_help_popup(f: &mut Frame) {
         Line::from("  ↑/↓ +/-  - Volume +/-"),
         Line::from("  R        - Remettre au début"),
         Line::from("  S        - Rechercher une musique"),
+        Line::from("  P        - Nouvelle playlist"),
+        Line::from("  D        - Supprimer playlist"),
+        Line::from("  A        - Ajouter piste à playlist"),
+        Line::from("  S        - Supprimer piste"),
+        Line::from("  L        - Lister playlists"),
+        Line::from("  C        - Changer de playlist"),
         Line::from("  H/F1     - Afficher/masquer cette aide"),
         Line::from("  Q/Esc    - Quitter"),
         Line::from(""),
         Line::from("Appuyez sur H ou F1 pour fermer"),
     ];
-    
+
     let help = Paragraph::new(help_text)
         .style(Style::default().fg(Color::White))
         .block(Block::default()
