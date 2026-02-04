@@ -1,1 +1,33 @@
-/target
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+pyvenv.cfg
+
+# Logs
+*.log
+
+# Python packaging
+*.egg-info/
+dist/
+build/
+
+# IDE / editor
+.vscode/
+*.swp
+*.swo
+.idea/
+
+# JSON / config générés
+library.json
+
+# Pyright cache
+.pyright/
+
+# Misc
+*.DS_Store
+
